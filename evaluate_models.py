@@ -27,9 +27,11 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
+from sklearn.svm import LinearSVC
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, roc_curve, auc,
@@ -94,8 +96,8 @@ def load_and_preprocess_data():
     print("[OK] Stratified split: Train {} / Test {}".format(X_train_raw.shape[0], X_test_raw.shape[0]))
     
     # Feature preprocessing
-    X_train_processed, X_test_processed, feature_names = preprocess_features(
-        X_train_raw, X_test_raw
+    X_train_processed, X_test_processed, feature_names, preprocessor = preprocess_features(
+        X_train_raw, X_test_raw, return_preprocessor=True
     )
     print("[OK] Features engineered: {} dimensions".format(X_train_processed.shape[1]))
     
@@ -105,7 +107,7 @@ def load_and_preprocess_data():
     )
     print("[OK] SMOTE applied: {} -> {} samples".format(X_train_processed.shape[0], X_train_balanced.shape[0]))
     
-    return X_train_balanced, X_test_processed, y_train_balanced, y_test.values
+    return X_train_balanced, X_test_processed, y_train_balanced, y_test.values, preprocessor, feature_names
 
 
 # ============================================================================
@@ -146,25 +148,106 @@ def train_baseline_models(X_train, y_train):
     models['KNN'] = KNeighborsClassifier(n_neighbors=5, n_jobs=-1).fit(X_train, y_train)
     print("    [OK] Trained")
     
-    # 5. SVM (linear kernel for faster training)
+    # 5. SVM (linear solver for faster training)
     print("[5] Support Vector Machine")
-    models['SVM'] = SVC(
-        kernel='linear', C=0.1, random_state=RANDOM_STATE, probability=True, max_iter=5000
+    models['SVM'] = LinearSVC(
+        dual=False, C=0.1, random_state=RANDOM_STATE, max_iter=5000
     ).fit(X_train, y_train)
     print("    [OK] Trained")
     
-    # 6. XGBoost
+    # 6. XGBoost / Gradient Boosting
     if XGBOOST_AVAILABLE:
         print("[6] XGBoost Classifier")
         models['XGBoost'] = xgb.XGBClassifier(
             n_estimators=100, max_depth=6, learning_rate=0.1,
             random_state=RANDOM_STATE, n_jobs=-1, eval_metric='logloss'
         ).fit(X_train, y_train)
-        print("    [OK] Trained")
+        print("    [OK] Trained", flush=True)
     else:
-        print("[6] XGBoost - SKIPPED (not installed)")
+        print("[6] Gradient Boosting Classifier (scikit-learn)")
+        models['Gradient Boosting'] = GradientBoostingClassifier(
+            n_estimators=40, max_depth=4, learning_rate=0.1,
+            subsample=0.8, random_state=RANDOM_STATE
+        ).fit(X_train, y_train)
+        print("    [OK] Trained", flush=True)
     
     return models
+
+
+def tune_selected_models(X_train, y_train):
+    """Tune required tree-based estimators using randomized search."""
+    print("\n" + "=" * 80)
+    print("HYPERPARAMETER TUNING")
+    print("=" * 80)
+
+    tuned_models = {}
+    tuning_summary = {}
+
+    # Random Forest tuning
+    rf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
+    rf_param_grid = {
+        'n_estimators': [100, 150, 200],
+        'max_depth': [None, 8, 12, 16],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    rf_search = RandomizedSearchCV(
+        rf,
+        rf_param_grid,
+        scoring='f1',
+        cv=2,
+        n_iter=5,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=2
+    )
+    print("[TUNE] Starting Random Forest search...")
+    rf_search.fit(X_train, y_train)
+    tuned_models['Random Forest (Tuned)'] = rf_search.best_estimator_
+    tuning_summary['Random Forest'] = {
+        'best_params': rf_search.best_params_,
+        'best_f1': rf_search.best_score_
+    }
+    print(f"[TUNE] Random Forest best F1: {rf_search.best_score_:.4f}")
+
+    # XGBoost / Gradient Boosting tuning
+    if XGBOOST_AVAILABLE:
+        boost = xgb.XGBClassifier(random_state=RANDOM_STATE, n_jobs=-1, eval_metric='logloss')
+        tuned_name = 'XGBoost (Tuned)'
+        boost_param_grid = {
+            'n_estimators': [100, 150, 200],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1]
+        }
+    else:
+        boost = GradientBoostingClassifier(random_state=RANDOM_STATE)
+        tuned_name = 'Gradient Boosting (Tuned)'
+        boost_param_grid = {
+            'n_estimators': [100, 150, 200],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1]
+        }
+
+    boost_search = RandomizedSearchCV(
+        boost,
+        boost_param_grid,
+        scoring='f1',
+        cv=2,
+        n_iter=5,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=2
+    )
+    print(f"[TUNE] Starting {tuned_name} search with {len(boost_param_grid)} candidate values...")
+    boost_search.fit(X_train, y_train)
+    tuned_models[tuned_name] = boost_search.best_estimator_
+    tuning_summary[tuned_name] = {
+        'best_params': boost_search.best_params_,
+        'best_f1': boost_search.best_score_
+    }
+    print(f"[TUNE] {tuned_name} best F1: {boost_search.best_score_:.4f}")
+
+    return tuned_models, tuning_summary
 
 
 # ============================================================================
@@ -362,6 +445,29 @@ def plot_precision_recall_curves(models, probabilities, y_test):
     plt.close()
 
 
+def plot_feature_importance(model, feature_names, output_filename):
+    """Generate a feature importance chart for tree-based models."""
+    if model is None or not hasattr(model, 'feature_importances_'):
+        print("[VIZ] Feature importance unavailable for the selected model.")
+        return
+
+    print("[VIZ] Generating Feature Importance Chart...")
+    importances = model.feature_importances_
+    sorted_idx = np.argsort(importances)[::-1]
+    sorted_names = [feature_names[i] for i in sorted_idx]
+    sorted_importances = importances[sorted_idx]
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sns.barplot(x=sorted_importances, y=sorted_names, palette='viridis', ax=ax)
+    ax.set_title('Feature Importance from Tree Ensemble', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Importance', fontsize=12)
+    ax.set_ylabel('Feature', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(VISUALS_DIR, output_filename), dpi=300, bbox_inches='tight')
+    print(f"    [OK] Saved: {output_filename}")
+    plt.close()
+
+
 def plot_leaderboard_heatmap(leaderboard):
     """Generate metric heatmap leaderboard."""
     print("[VIZ] Generating Metrics Heatmap Leaderboard...")
@@ -412,7 +518,7 @@ def main():
     print("=" * 80)
     
     # Step 1: Load & preprocess data
-    X_train, X_test, y_train, y_test = load_and_preprocess_data()
+    X_train, X_test, y_train, y_test, preprocessor, feature_names = load_and_preprocess_data()
     
     # Step 2: Train models
     models = train_baseline_models(X_train, y_train)
@@ -435,6 +541,12 @@ def main():
     plot_confusion_matrices(models, predictions, y_test)
     plot_accuracy_vs_f1(leaderboard)
     plot_precision_recall_curves(models, probabilities, y_test)
+    best_tree_model = None
+    for candidate in ['XGBoost', 'Gradient Boosting', 'Random Forest']:
+        if candidate in models:
+            best_tree_model = models[candidate]
+            break
+    plot_feature_importance(best_tree_model, feature_names, '06_feature_importance.png')
     plot_leaderboard_heatmap(leaderboard)
     
     # Step 6: Export results

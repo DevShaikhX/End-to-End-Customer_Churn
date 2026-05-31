@@ -17,9 +17,12 @@ Usage:
 
 from typing import Tuple, List, Dict, Any
 
+import os
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, OrdinalEncoder
 from sklearn.impute import SimpleImputer
 
 
@@ -42,6 +45,12 @@ def load_and_clean_base_data(filepath: str) -> pd.DataFrame:
         FileNotFoundError: If filepath does not exist.
         KeyError: If required columns ('Churn', 'TotalCharges') are missing.
     """
+    # Resolve a common project structure: prefer `data/` directory if available
+    if filepath == 'WA_Fn-UseC_-Telco-Customer-Churn.csv':
+        fallback_path = os.path.join('data', os.path.basename(filepath))
+        if os.path.exists(fallback_path) and not os.path.exists(filepath):
+            filepath = fallback_path
+
     # Load dataset
     df = pd.read_csv(filepath, low_memory=False)
     
@@ -67,6 +76,68 @@ def load_and_clean_base_data(filepath: str) -> pd.DataFrame:
     return df
 
 
+def build_preprocessor(
+    X_train: pd.DataFrame,
+    numerical_features: List[str] = None,
+    binary_categorical_features: List[str] = None,
+    multi_class_categorical_features: List[str] = None,
+) -> Tuple[Pipeline, List[str]]:
+    """Build a reusable preprocessing pipeline fitted on training data only."""
+    X_train = X_train.copy()
+
+    # Auto-detect feature groups by dtype if not provided
+    numerical_features = numerical_features or X_train.select_dtypes(include=[np.number]).columns.tolist()
+    cat_candidates = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    if binary_categorical_features is None or multi_class_categorical_features is None:
+        binary_categorical_features = []
+        multi_class_categorical_features = []
+        for col in cat_candidates:
+            n_unique = X_train[col].nunique(dropna=False)
+            if n_unique <= 2:
+                binary_categorical_features.append(col)
+            else:
+                multi_class_categorical_features.append(col)
+
+    transformers = []
+
+    if numerical_features:
+        transformers.append(
+            ('num', Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scaler', StandardScaler())
+            ]), numerical_features)
+        )
+
+    if binary_categorical_features:
+        transformers.append(
+            ('bin', Pipeline([
+                ('imputer', SimpleImputer(strategy='most_frequent')),
+                ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
+            ]), binary_categorical_features)
+        )
+
+    if multi_class_categorical_features:
+        transformers.append(
+            ('multi', Pipeline([
+                ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                ('encoder', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+            ]), multi_class_categorical_features)
+        )
+
+    preprocessor = ColumnTransformer(transformers, remainder='drop', sparse_threshold=0)
+    preprocessor.fit(X_train)
+
+    feature_names = []
+    feature_names.extend(numerical_features)
+    feature_names.extend(binary_categorical_features)
+    if multi_class_categorical_features:
+        ohe = preprocessor.named_transformers_['multi'].named_steps['encoder']
+        feature_names.extend(ohe.get_feature_names_out(multi_class_categorical_features).tolist())
+
+    return preprocessor, feature_names
+
+
 def preprocess_features(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -74,7 +145,8 @@ def preprocess_features(
     numerical_features: List[str] = None,
     binary_categorical_features: List[str] = None,
     multi_class_categorical_features: List[str] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    return_preprocessor: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Any]:
     """Preprocess train and test feature matrices with zero data leakage.
     
     Pipeline:
@@ -114,89 +186,18 @@ def preprocess_features(
     X_train = X_train.drop(columns=[target_col], errors='ignore').copy()
     X_test = X_test.drop(columns=[target_col], errors='ignore').copy()
     
-    # Auto-detect feature types if not explicitly provided
-    if numerical_features is None:
-        numerical_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
-    
-    if binary_categorical_features is None or multi_class_categorical_features is None:
-        categorical_features = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
-        if binary_categorical_features is None and multi_class_categorical_features is None:
-            # Auto-split: if unique values <= 2, treat as binary; else as multi-class
-            binary_categorical_features = []
-            multi_class_categorical_features = []
-            for col in categorical_features:
-                n_unique = X_train[col].nunique()
-                if n_unique <= 2:
-                    binary_categorical_features.append(col)
-                else:
-                    multi_class_categorical_features.append(col)
-    
-    # ==================== NUMERICAL FEATURES ====================
-    # Fit StandardScaler ONLY on training data (prevents leakage)
-    # First impute missing values using training set median
-    imputer = SimpleImputer(strategy='median')
-    X_train_numerical_imputed = imputer.fit_transform(X_train[numerical_features])
-    X_test_numerical_imputed = imputer.transform(X_test[numerical_features])
-    
-    scaler = StandardScaler()
-    X_train_numerical = scaler.fit_transform(X_train_numerical_imputed)
-    X_test_numerical = scaler.transform(X_test_numerical_imputed)
-    
-    # ==================== BINARY CATEGORICAL FEATURES ====================
-    # For binary features, use LabelEncoder or simple binary mapping
-    X_train_binary = []
-    X_test_binary = []
-    binary_feature_names = []
-    
-    for col in binary_categorical_features:
-        le = LabelEncoder()
-        le.fit(X_train[col].astype(str))
-        
-        X_train_binary.append(le.transform(X_train[col].astype(str)).reshape(-1, 1))
-        X_test_binary.append(le.transform(X_test[col].astype(str)).reshape(-1, 1))
-        
-        # Create feature name (e.g., "feature_0" or use the encoded class names)
-        binary_feature_names.append(f"{col}_encoded")
-    
-    X_train_binary_arr = np.hstack(X_train_binary) if X_train_binary else np.empty((X_train.shape[0], 0))
-    X_test_binary_arr = np.hstack(X_test_binary) if X_test_binary else np.empty((X_test.shape[0], 0))
-    
-    # ==================== MULTI-CLASS CATEGORICAL FEATURES ====================
-    # Fit OneHotEncoder ONLY on training data (prevents leakage)
-    ohe_feature_names = []
-    if multi_class_categorical_features:
-        ohe = OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore')
-        ohe.fit(X_train[multi_class_categorical_features])
-        
-        X_train_ohe = ohe.transform(X_train[multi_class_categorical_features])
-        X_test_ohe = ohe.transform(X_test[multi_class_categorical_features])
-        
-        # Extract feature names from OneHotEncoder
-        ohe_feature_names = ohe.get_feature_names_out(multi_class_categorical_features).tolist()
-    else:
-        X_train_ohe = np.empty((X_train.shape[0], 0))
-        X_test_ohe = np.empty((X_test.shape[0], 0))
-    
-    # ==================== CONCATENATE ALL ====================
-    X_train_final = np.hstack([
-        X_train_numerical,
-        X_train_binary_arr,
-        X_train_ohe
-    ])
-    
-    X_test_final = np.hstack([
-        X_test_numerical,
-        X_test_binary_arr,
-        X_test_ohe
-    ])
-    
-    # Build final feature names list
-    feature_names = (
-        numerical_features +
-        binary_feature_names +
-        ohe_feature_names
+    preprocessor, feature_names = build_preprocessor(
+        X_train,
+        numerical_features=numerical_features,
+        binary_categorical_features=binary_categorical_features,
+        multi_class_categorical_features=multi_class_categorical_features,
     )
     
+    X_train_final = preprocessor.transform(X_train)
+    X_test_final = preprocessor.transform(X_test)
+    
+    if return_preprocessor:
+        return X_train_final, X_test_final, feature_names, preprocessor
     return X_train_final, X_test_final, feature_names
 
 
