@@ -43,17 +43,18 @@ Telco-Churn-Stabilizer/
 
 The pinned `requirements.txt` includes the exact dependency versions used for reproducible deployment:
 
-- `streamlit==1.26.0`
+- `streamlit==1.58.0`
 - `scikit-learn==1.8.0`
 - `xgboost==1.7.6`
 - `pandas==2.3.3`
-- `numpy==1.26.4`
+- `numpy==2.3.5`
 - `plotly==6.5.2`
 - `joblib==1.5.3`
 - `imbalanced-learn==0.14.1`
 - `matplotlib==3.10.9`
 - `seaborn==0.13.2`
 - `scipy==1.17.0`
+ - `pillow==12.2.0`
 
 ## Validation Leaderboard
 
